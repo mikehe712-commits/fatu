@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>排版热路径对比 · 写了就发复刻版</title>
+    <style>
+      body { margin: 0; padding: 32px; font: 14px/1.6 -apple-system, "PingFang SC", sans-serif; color: #17202f; background: #fff; }
+      h1 { font-size: 20px; margin: 0 0 4px; }
+      p.lead { color: #6f7785; margin: 0 0 24px; max-width: 62ch; }
+      table { border-collapse: collapse; margin: 18px 0; font-variant-numeric: tabular-nums; }
+      th, td { padding: 8px 14px; border-bottom: 1px solid #e3e8ef; text-align: right; }
+      th:first-child, td:first-child { text-align: left; }
+      thead th { border-bottom: 2px solid #17202f; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: #6f7785; }
+      tfoot td { font-weight: 650; border-bottom: 0; }
+      .win { color: #1f8a63; font-weight: 650; }
+      button { height: 34px; padding: 0 16px; font: inherit; font-weight: 550; color: #fff; background: #17202f; border: 0; border-radius: 9px; cursor: pointer; }
+      pre { padding: 14px; background: #f8fafc; border-radius: 10px; overflow-x: auto; font-size: 12.5px; }
+      code { background: #f1f5f9; padding: 1px 5px; border-radius: 4px; }
+      .note { font-size: 12.5px; color: #6f7785; max-width: 70ch; }
+    </style>
+  </head>
+  <body>
+    <h1>排版热路径对比</h1>
+    <p class="lead">
+      同一份中文文档，用两种方式测量每个断行单元的宽度。
+      A 是原版 <code>write-then-publish</code> 的写法，B 是复刻版的写法。
+      两者产出的宽度完全一致，只是缓存策略不同。
+    </p>
+    <button id="run" type="button">开始测试</button>
+    <div id="out"></div>
+
+    <script>
+      /* ── A: original approach (fxyadela/write-then-publish, src/app.js) ──
+         graphemeSegments() constructs a new Intl.Segmenter on every call, and
+         glyphWidth() assigns ctx.font before every measureText.               */
+      function A_graphemeSegments(text) {
+        if (window.Intl && Intl.Segmenter) {
+          const segmenter = new Intl.Segmenter("zh", { granularity: "grapheme" });
+          return Array.from(segmenter.segment(text), (p) => ({ text: p.segment, start: p.index, end: p.index + p.segment.length }));
+        }
+        return Array.from(text, (ch, i) => ({ text: ch, start: i, end: i + 1 }));
+      }
+      function A_splitTokenText(text) {
+        const segments = A_graphemeSegments(text);
+        const units = [];
+        let word = null;
+        const flush = () => { if (word) { units.push(word); word = null; } };
+        for (const seg of segments) {
+          if (/^[A-Za-z0-9_@#%+./:-]$/.test(seg.text)) {
+            if (!word) word = { text: "", start: seg.start, end: seg.end };
+            word.text += seg.text; word.end = seg.end;
+            continue;
+          }
+          flush(); units.push(seg);
+        }
+        flush();
+        return units;
+      }
+      function A_fontFamily(text, s) {
+        return /[A-Za-z0-9_@#%+./:-]/.test(text || "")
+          ? s.en + "," + s.zh + ',"Apple Color Emoji"'
+          : s.zh + "," + s.en + ',"Apple Color Emoji"';
+      }
+      function A_measure(ctx, lines, style) {
+        let total = 0;
+        for (const line of lines) {
+          for (const unit of A_splitTokenText(line)) {
+            ctx.font = "400 " + style.size + "px " + A_fontFamily(unit.text, style);
+            total += ctx.measureText(unit.text).width + Math.max(0.8, style.size * 0.025);
+          }
+        }
+        return total;
+      }
+
+      /* ── B: this clone (src/engine.js) — singleton segmenter, memoised unit
+         splitting, memoised advance widths, ctx.font only on change.        */
+      let B_segmenter = null;
+      const B_units = new Map();
+      const B_widths = new Map();
+      function B_graphemes(text) {
+        if (!B_segmenter) B_segmenter = new Intl.Segmenter("zh", { granularity: "grapheme" });
+        const out = [];
+        for (const p of B_segmenter.segment(text)) out.push({ text: p.segment, start: p.index, end: p.index + p.segment.length });
+        return out;
+      }
+      function B_wrapUnits(text) {
+        const hit = B_units.get(text);
+        if (hit) return hit;
+        const units = [];
+        let word = null;
+        for (const seg of B_graphemes(text)) {
+          if (/^[A-Za-z0-9_@#%+./:-]$/.test(seg.text)) {
+            if (!word) word = { text: "", start: seg.start, end: seg.end };
+            word.text += seg.text; word.end = seg.end;
+            continue;
+          }
+          if (word) { units.push(word); word = null; }
+          units.push(seg);
+        }
+        if (word) units.push(word);
+        B_units.set(text, units);
+        return units;
+      }
+      function B_advance(ctx, text, font) {
+        const key = font + " " + text;
+        const hit = B_widths.get(key);
+        if (hit !== undefined) return hit;
+        if (ctx.__font !== font) { ctx.font = font; ctx.__font = font; }
+        const w = ctx.measureText(text).width;
+        B_widths.set(key, w);
+        return w;
+      }
+      function B_measure(ctx, lines, style) {
+        let total = 0;
+        for (const line of lines) {
+          for (const unit of B_wrapUnits(line)) {
+            const font = "400 " + style.size + "px " + A_fontFamily(unit.text, style);
+            total += B_advance(ctx, unit.text, font) + Math.max(0.8, style.size * 0.025);
+          }
+        }
+        return total;
+      }
+
+      /* ── Harness ──────────────────────────────────────────────────────── */
+      const STYLE = {
+        size: 34,
+        zh: '"PingFang SC","Hiragino Sans GB",sans-serif',
+        en: '-apple-system,BlinkMacSystemFont,Helvetica,sans-serif',
+      };
+
+      function makeDoc(sections) {
+        const lines = [];
+        for (let i = 1; i <= sections; i += 1) {
+          lines.push("第 " + i + " 节标题");
+          lines.push("这是第 " + i + " 段正文，用来测试长文档下的排版性能。中文字符的宽度测量是这个应用最热的路径，每个汉字都是一个独立的断行单元。");
+          lines.push("列表项 " + i + "-1，带一点额外的说明文字，混入 Latin words and 数字 " + i * 137 + " 一起测量。");
+          lines.push("引用块 " + i + "：写了就发把 Markdown 排成图文卡片。");
+        }
+        return lines;
+      }
+
+      function time(fn, runs) {
+        // One warm-up run so both sides pay their first-call costs outside the clock.
+        fn();
+        const t0 = performance.now();
+        for (let i = 0; i < runs; i += 1) fn();
+        return (performance.now() - t0) / runs;
+      }
+
+      document.getElementById("run").addEventListener("click", () => {
+        const ctx = document.createElement("canvas").getContext("2d");
+        const rows = [];
+        for (const sections of [10, 30, 60, 120]) {
+          const lines = makeDoc(sections);
+          const chars = lines.join("").length;
+          const runs = sections > 60 ? 8 : 20;
+
+          B_units.clear(); B_widths.clear();
+          const a = time(() => A_measure(ctx, lines, STYLE), runs);
+          const b = time(() => B_measure(ctx, lines, STYLE), runs);
+
+          // Same input must give the same total width.
+          const same = Math.abs(A_measure(ctx, lines, STYLE) - B_measure(ctx, lines, STYLE)) < 0.001;
+          rows.push({ sections, chars, lines: lines.length, a, b, same, speedup: a / b });
+        }
+
+        const out = document.getElementById("out");
+        out.innerHTML =
+          "<table><thead><tr><th>文档规模</th><th>字符数</th><th>A 原版写法</th><th>B 复刻版</th><th>提速</th><th>结果一致</th></tr></thead><tbody>" +
+          rows.map((r) =>
+            "<tr><td>" + r.sections + " 节 / " + r.lines + " 行</td><td>" + r.chars +
+            "</td><td>" + r.a.toFixed(2) + " ms</td><td>" + r.b.toFixed(2) +
+            " ms</td><td class='win'>" + r.speedup.toFixed(1) + "×</td><td>" + (r.same ? "✓" : "✗") + "</td></tr>"
+          ).join("") +
+          "</tbody><tfoot><tr><td>平均</td><td></td><td></td><td></td><td class='win'>" +
+          (rows.reduce((s, r) => s + r.speedup, 0) / rows.length).toFixed(1) + "×</td><td></td></tr></tfoot></table>" +
+          "<p class='note'>缓存命中后，B 的每次重排基本只剩加法运算；A 每个汉字都要新建一个 Intl.Segmenter 并重设 ctx.font。" +
+          "这条路径在原版里每次按键都会跑一遍，所以长文打字会掉帧。</p>" +
+          "<pre>navigator.userAgent = " + navigator.userAgent + "</pre>";
+      });
+    </script>
+  </body>
+</html>
